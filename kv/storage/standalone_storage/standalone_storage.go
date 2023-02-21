@@ -60,6 +60,9 @@ func (s *StandAloneStorage) Write(ctx *kvrpcpb.Context, batch []storage.Modify) 
 		default:
 			println("StandAloneStorage Write unknown type: %s", modify.Data)
 		}
+		if err == badger.ErrKeyNotFound {
+			err = nil
+		}
 		if err != nil {
 			break
 		}

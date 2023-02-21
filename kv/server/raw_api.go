@@ -5,8 +5,6 @@ import (
 
 	"github.com/pingcap-incubator/tinykv/kv/storage"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/kvrpcpb"
-
-	"github.com/Connor1996/badger"
 )
 
 // The functions below are Server's Raw API. (implements TinyKvServer).
@@ -23,9 +21,6 @@ func (server *Server) RawGet(_ context.Context, req *kvrpcpb.RawGetRequest) (*kv
 	}
 	var val []byte
 	val, err = reader.GetCF(req.GetCf(), req.GetKey())
-	if err == badger.ErrKeyNotFound {
-		err = nil
-	}
 	if err != nil {
 		return nil, err
 	}
@@ -67,9 +62,6 @@ func (server *Server) RawDelete(_ context.Context, req *kvrpcpb.RawDeleteRequest
 	}
 	batch := storage.Modify{Data: del}
 	err := server.storage.Write(req.GetContext(), []storage.Modify{batch})
-	if err == badger.ErrKeyNotFound {
-		err = nil
-	}
 	if err != nil {
 		return nil, err
 	}
@@ -90,7 +82,7 @@ func (server *Server) RawScan(_ context.Context, req *kvrpcpb.RawScanRequest) (*
 	defer iterCF.Close()
 	var kvs []*kvrpcpb.KvPair
 	limit := req.Limit
-	for iterCF.Seek([]byte(req.GetStartKey())); iterCF.Valid(); iterCF.Next() {
+	for iterCF.Seek(req.GetStartKey()); iterCF.Valid(); iterCF.Next() {
 		item := iterCF.Item()
 		var key []byte
 		var val []byte
