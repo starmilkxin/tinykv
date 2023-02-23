@@ -56,7 +56,19 @@ type RaftLog struct {
 // to the state that it just commits and applies the latest snapshot.
 func newLog(storage Storage) *RaftLog {
 	// Your Code Here (2A).
-	return nil
+	firstIdx, _ := storage.FirstIndex()
+	lastIdx, _ := storage.LastIndex()
+	entries, _ := storage.Entries(firstIdx, lastIdx+1)
+	hardState, _, _ := storage.InitialState()
+	raftLog := &RaftLog{
+		storage:         storage,
+		committed:       hardState.GetCommit(),
+		applied:         firstIdx - 1,
+		stabled:         lastIdx,
+		entries:         entries,
+		pendingSnapshot: nil,
+	}
+	return raftLog
 }
 
 // We need to compact the log entries in some point of time like
@@ -71,29 +83,45 @@ func (l *RaftLog) maybeCompact() {
 // note, this is one of the test stub functions you need to implement.
 func (l *RaftLog) allEntries() []pb.Entry {
 	// Your Code Here (2A).
-	return nil
+	return l.entries
 }
 
 // unstableEntries return all the unstable entries
 func (l *RaftLog) unstableEntries() []pb.Entry {
 	// Your Code Here (2A).
-	return nil
+	return l.entries[l.stabled-l.entries[0].Index+1:]
 }
 
 // nextEnts returns all the committed but not applied entries
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	// Your Code Here (2A).
-	return nil
+	offset := l.entries[0].GetIndex()
+	return l.entries[l.applied+1-offset : l.committed+1-offset]
 }
 
 // LastIndex return the last index of the log entries
 func (l *RaftLog) LastIndex() uint64 {
 	// Your Code Here (2A).
-	return 0
+	if len(l.entries) == 0 {
+		lastIndex, _ := l.storage.LastIndex()
+		return lastIndex
+	}
+	return l.entries[0].GetIndex() + uint64(len(l.entries)) - 1
 }
 
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// Your Code Here (2A).
-	return 0, nil
+	var offset uint64
+	if len(l.entries) == 0 {
+		return 0, nil
+	}
+	offset = l.entries[0].GetIndex()
+	if i < offset {
+		return l.storage.Term(i)
+	}
+	if int(i-offset+1) > len(l.entries) {
+		return 0, ErrUnavailable
+	}
+	return l.entries[i-offset].GetTerm(), nil
 }
