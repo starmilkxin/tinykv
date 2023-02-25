@@ -308,6 +308,13 @@ func (r *Raft) becomeLeader() {
 			Next:  r.RaftLog.LastIndex() + 1, // raft 论文
 		}
 	}
+	// NOTE: Leader should propose a noop entry on its term
+	r.RaftLog.entries = append(r.RaftLog.entries, pb.Entry{
+		EntryType: pb.EntryType_EntryNormal,
+		Term:      r.Term,
+		Index:     r.RaftLog.LastIndex() + 1,
+		Data:      nil,
+	})
 	// 只有自己的特殊情况
 	if 1 > len(r.Prs)/2 {
 		r.RaftLog.committed = r.RaftLog.LastIndex()
@@ -556,11 +563,13 @@ func (r *Raft) handlePropose(m pb.Message) error {
 	for _, entry := range m.Entries {
 		r.RaftLog.entries = append(r.RaftLog.entries, pb.Entry{
 			EntryType: entry.EntryType,
-			Term:      entry.Term,
-			Index:     entry.Index,
+			Term:      r.Term,
+			Index:     r.RaftLog.LastIndex() + 1,
 			Data:      entry.Data,
 		})
 	}
+	r.Prs[r.id].Match = r.RaftLog.LastIndex()
+	r.Prs[r.id].Next = r.RaftLog.LastIndex() + 1
 	// 向其他所有节点发送追加日志 RPC，即 MsgAppend，用于集群同步
 	for node, _ := range r.Prs {
 		if node == r.id {
@@ -602,21 +611,33 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	// 如果接收者日志中没有包含这样一个条目：即该条目的任期在 prevLogIndex 上无法和 prevLogTerm 匹配上，拒绝
 	if len(r.RaftLog.entries) > 0 {
 		offset := r.RaftLog.entries[0].GetIndex()
-		if m.GetIndex() < offset || m.GetTerm() != r.RaftLog.entries[m.GetIndex()-offset].GetTerm() {
+		if m.GetIndex() >= offset && m.GetLogTerm() != r.RaftLog.entries[m.GetIndex()-offset].GetTerm() {
 			r.msgs = append(r.msgs, msgResp)
 			return
 		}
 	}
 	// 追加新条目，同时删除冲突条目
 	for _, entry := range m.GetEntries() {
-		for ; entry.GetIndex() <= r.RaftLog.LastIndex(); r.RaftLog.entries = r.RaftLog.entries[:len(r.RaftLog.entries)] {
+		// 发生冲突，可能删除冲突条目
+		if len(r.RaftLog.entries) > 0 && entry.GetIndex() <= r.RaftLog.LastIndex() {
+			targetTerm, _ := r.RaftLog.Term(entry.GetIndex())
+			// 删除冲突条目并添加新条目
+			if entry.GetTerm() != targetTerm {
+				r.RaftLog.DeleteAndAppendEntry(pb.Entry{
+					EntryType: entry.GetEntryType(),
+					Term:      entry.GetTerm(),
+					Index:     entry.GetIndex(),
+					Data:      entry.GetData(),
+				})
+			}
+		} else {
+			r.RaftLog.entries = append(r.RaftLog.entries, pb.Entry{
+				EntryType: entry.GetEntryType(),
+				Term:      entry.GetTerm(),
+				Index:     entry.GetIndex(),
+				Data:      entry.GetData(),
+			})
 		}
-		r.RaftLog.entries = append(r.RaftLog.entries, pb.Entry{
-			EntryType: entry.GetEntryType(),
-			Term:      entry.GetTerm(),
-			Index:     entry.GetIndex(),
-			Data:      entry.GetData(),
-		})
 	}
 	// 接受者的commit = 发送者的commit与发送者传来的最后一个entry的index的较小值
 	if m.GetCommit() > r.RaftLog.committed {
@@ -640,23 +661,7 @@ func (r *Raft) handleAppendResponse(m pb.Message) {
 		r.Prs[m.GetFrom()].Next = m.GetIndex() + 1
 	}
 	// 更新leader的commit，超过一半节点的match所大于的最大值作为commit，同时其与现在的term相等
-	matchList := make([]uint64, 0)
-	for _, progress := range r.Prs {
-		matchList = append(matchList, progress.Match)
-	}
-	sort.Slice(matchList, func(i, j int) bool {
-		if matchList[i] < matchList[j] {
-			return true
-		}
-		return false
-	})
-	maxN := matchList[(len(r.Prs)-1)/2]
-	for ; maxN > r.RaftLog.committed; maxN-- {
-		if term, _ := r.RaftLog.Term(maxN); term == r.Term {
-			r.RaftLog.committed = maxN
-			break
-		}
-	}
+	r.checkRaftCommit()
 }
 
 func (r *Raft) handleRequestVote(m pb.Message) {
@@ -681,7 +686,7 @@ func (r *Raft) handleRequestVote(m pb.Message) {
 	// 如果两份日志最后的条目的任期号不同，那么任期号大的日志更加新
 	// 如果两份日志最后的条目任期号相同，那么日志比较长的那个就更加新
 	rLastTerm, _ := r.RaftLog.Term(r.RaftLog.LastIndex())
-	if (m.GetLogTerm() >= rLastTerm) || (m.GetLogTerm() == rLastTerm && m.GetIndex() > r.RaftLog.LastIndex()) {
+	if (m.GetLogTerm() > rLastTerm) || (m.GetLogTerm() == rLastTerm && m.GetIndex() >= r.RaftLog.LastIndex()) {
 		msgResp.Reject = false
 		r.Vote = m.GetFrom()
 	}
@@ -749,4 +754,36 @@ func (r *Raft) addNode(id uint64) {
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
+}
+
+// 更新leader的commit，超过一半节点的match所大于的最大值作为commit，同时其与现在的term相等
+// 如果commit更新，则立即广播给其他节点用以同步commit
+func (r *Raft) checkRaftCommit() {
+	matchList := make([]uint64, 0)
+	for node, progress := range r.Prs {
+		if node == r.id {
+			continue
+		}
+		matchList = append(matchList, progress.Match)
+	}
+	sort.Slice(matchList, func(i, j int) bool {
+		if matchList[i] < matchList[j] {
+			return true
+		}
+		return false
+	})
+	maxN := matchList[(len(r.Prs)-1)/2]
+	for ; maxN > r.RaftLog.committed; maxN-- {
+		if term, _ := r.RaftLog.Term(maxN); term == r.Term {
+			r.RaftLog.committed = maxN
+			// 立即广播给其他节点用以同步commit
+			for k := range r.Prs {
+				if k == r.id {
+					continue
+				}
+				r.sendAppend(k)
+			}
+			break
+		}
+	}
 }

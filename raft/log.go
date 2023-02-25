@@ -89,7 +89,14 @@ func (l *RaftLog) allEntries() []pb.Entry {
 // unstableEntries return all the unstable entries
 func (l *RaftLog) unstableEntries() []pb.Entry {
 	// Your Code Here (2A).
-	return l.entries[l.stabled-l.entries[0].Index+1:]
+	var offset uint64
+	if len(l.entries) > 0 {
+		offset = l.entries[0].GetIndex()
+	}
+	if len(l.entries) > 0 && l.stabled-offset+1 <= uint64(len(l.entries)) {
+		return l.entries[l.stabled-offset+1:]
+	}
+	return []pb.Entry{}
 }
 
 // nextEnts returns all the committed but not applied entries
@@ -124,4 +131,24 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 		return 0, ErrUnavailable
 	}
 	return l.entries[i-offset].GetTerm(), nil
+}
+
+func (l *RaftLog) DeleteAndAppendEntry(appendEntry pb.Entry) {
+	for idx, entry := range l.entries {
+		if entry.GetIndex() != appendEntry.GetIndex() {
+			continue
+		}
+		if idx == 0 {
+			l.entries = []pb.Entry{}
+			l.stabled = 0
+		} else {
+			l.entries = l.entries[:idx]
+		}
+		break
+	}
+	l.entries = append(l.entries, appendEntry)
+	lastIndex := l.LastIndex()
+	l.committed = min(l.committed, lastIndex-1)
+	l.applied = min(l.applied, lastIndex-1)
+	l.stabled = min(l.stabled, lastIndex-1)
 }
