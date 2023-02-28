@@ -102,6 +102,9 @@ func (l *RaftLog) unstableEntries() []pb.Entry {
 // nextEnts returns all the committed but not applied entries
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	// Your Code Here (2A).
+	if len(l.entries) == 0 {
+		return nil
+	}
 	offset := l.entries[0].GetIndex()
 	return l.entries[l.applied+1-offset : l.committed+1-offset]
 }

@@ -156,7 +156,7 @@ func (rn *RawNode) Ready() Ready {
 		Entries:          rn.Raft.RaftLog.unstableEntries(),
 		Snapshot:         pb.Snapshot{},
 		CommittedEntries: rn.Raft.RaftLog.nextEnts(),
-		Messages:         nil,
+		Messages:         rn.Raft.msgs,
 	}
 	softState := rn.GetSoftState()
 	if !isSoftStateEqual(softState, rn.lastSoftState) {
