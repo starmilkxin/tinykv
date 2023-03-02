@@ -473,7 +473,7 @@ func (r *Raft) sendAppend(to uint64) bool {
 	// Your Code Here (2A).
 	prevIndex := r.Prs[to].Next - 1
 	prevTerm, prevTermErr := r.RaftLog.Term(prevIndex)
-	// 目标节点落后任期过多,要发送的entry已被压缩，发送当前快照
+	// 如果目标节点需要的最早日志不在当前节点内存中，则要发送的entry已被压缩，发送当前快照
 	if prevTermErr != nil {
 		r.sendSnapshot(to)
 		return false
@@ -506,6 +506,19 @@ func (r *Raft) sendAppend(to uint64) bool {
 }
 
 func (r *Raft) sendSnapshot(to uint64) {
+	snapshot, err := r.RaftLog.storage.Snapshot()
+	if err != nil {
+		return
+	}
+	msg := pb.Message{
+		MsgType:  pb.MessageType_MsgSnapshot,
+		From:     r.id,
+		To:       to,
+		Term:     r.Term,
+		Snapshot: &snapshot,
+	}
+	r.msgs = append(r.msgs, msg)
+	r.Prs[to].Next = snapshot.Metadata.Index + 1
 }
 
 func (r *Raft) handleHup() {
@@ -660,7 +673,7 @@ func (r *Raft) handleAppendResponse(m pb.Message) {
 		r.Prs[m.GetFrom()].Match = m.GetIndex()
 		r.Prs[m.GetFrom()].Next = m.GetIndex() + 1
 	}
-	// 更新leader的commit，超过一半节点的match所大于的最大值作为commit，同时其与现在的term相等
+	// 更新leader的commit，将超过一半节点的 match所大于的最大值作为commit，同时其与现在的term相等
 	r.checkRaftCommit()
 }
 
@@ -719,6 +732,44 @@ func (r *Raft) handleRequestVoteResponse(m pb.Message) {
 // handleSnapshot handle Snapshot RPC request
 func (r *Raft) handleSnapshot(m pb.Message) {
 	// Your Code Here (2C).
+	msg := pb.Message{
+		MsgType: pb.MessageType_MsgAppendResponse,
+		From:    r.id,
+		To:      m.GetFrom(),
+		Term:    r.Term,
+		Reject:  false,
+		Index:   r.RaftLog.committed,
+	}
+	meta := m.Snapshot.Metadata
+	// 快照最新的日志的 index <= 目标节点最新 committed 日志的 index
+	if meta.Index <= r.RaftLog.committed {
+		r.msgs = append(r.msgs, msg)
+		return
+	}
+	r.becomeFollower(max(r.Term, m.Term), m.From)
+	if len(r.RaftLog.entries) > 0 {
+		r.RaftLog.entries = nil
+	}
+	r.RaftLog.applied = meta.Index
+	r.RaftLog.committed = meta.Index
+	r.RaftLog.stabled = meta.Index
+	r.Prs = make(map[uint64]*Progress)
+	for _, peer := range meta.ConfState.Nodes {
+		if peer == r.id {
+			r.Prs[peer] = &Progress{
+				Match: meta.Index,
+				Next:  meta.Index + 1,
+			}
+		} else {
+			r.Prs[peer] = &Progress{}
+		}
+	}
+	// 赋值待定快照
+	r.RaftLog.pendingSnapshot = m.Snapshot
+	// 更新 MsgAppendResponse
+	msg.Term = r.Term
+	msg.Index = r.RaftLog.committed
+	r.msgs = append(r.msgs, msg)
 }
 
 // handleHeartbeat handle Heartbeat RPC request

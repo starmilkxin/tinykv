@@ -76,6 +76,19 @@ func newLog(storage Storage) *RaftLog {
 // grow unlimitedly in memory
 func (l *RaftLog) maybeCompact() {
 	// Your Code Here (2C).
+	if len(l.entries) == 0 {
+		return
+	}
+	// 未压缩的第一个日志的index
+	storageFirstIdx, _ := l.storage.FirstIndex()
+	// 先前的第一个日志的index
+	raftLogFirstIdx := l.entries[0].GetIndex()
+	// 未压缩的第一个日志的index > 先前的第一个日志的index，则说明先前的日志发生了压缩，需要对日志进行gc
+	if storageFirstIdx > raftLogFirstIdx {
+		entries := l.entries[storageFirstIdx-raftLogFirstIdx:]
+		l.entries = make([]pb.Entry, len(entries))
+		copy(l.entries, entries)
+	}
 }
 
 // allEntries return all the entries not compacted.
