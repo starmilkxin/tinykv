@@ -50,6 +50,7 @@ type RaftLog struct {
 	pendingSnapshot *pb.Snapshot
 
 	// Your Data Here (2A).
+	FirstIndex uint64
 }
 
 // newLog returns log using the given storage. It recovers the log
@@ -67,6 +68,7 @@ func newLog(storage Storage) *RaftLog {
 		stabled:         lastIdx,
 		entries:         entries,
 		pendingSnapshot: nil,
+		FirstIndex:      firstIdx,
 	}
 	return raftLog
 }
@@ -76,18 +78,14 @@ func newLog(storage Storage) *RaftLog {
 // grow unlimitedly in memory
 func (l *RaftLog) maybeCompact() {
 	// Your Code Here (2C).
-	if len(l.entries) == 0 {
-		return
-	}
-	// 未压缩的第一个日志的index
-	storageFirstIdx, _ := l.storage.FirstIndex()
-	// 先前的第一个日志的index
-	raftLogFirstIdx := l.entries[0].GetIndex()
-	// 未压缩的第一个日志的index > 先前的第一个日志的index，则说明先前的日志发生了压缩，需要对日志进行gc
-	if storageFirstIdx > raftLogFirstIdx {
-		entries := l.entries[storageFirstIdx-raftLogFirstIdx:]
-		l.entries = make([]pb.Entry, len(entries))
-		copy(l.entries, entries)
+	first, _ := l.storage.FirstIndex()
+	if first > l.FirstIndex {
+		if len(l.entries) > 0 {
+			entries := l.entries[l.toSliceIndex(first):]
+			l.entries = make([]pb.Entry, len(entries))
+			copy(l.entries, entries)
+		}
+		l.FirstIndex = first
 	}
 }
 
@@ -104,7 +102,7 @@ func (l *RaftLog) unstableEntries() []pb.Entry {
 	// Your Code Here (2A).
 	var offset uint64
 	if len(l.entries) > 0 {
-		offset = l.entries[0].GetIndex()
+		offset = l.FirstIndex
 	}
 	if len(l.entries) > 0 && l.stabled-offset+1 <= uint64(len(l.entries)) {
 		return l.entries[l.stabled-offset+1:]
@@ -118,7 +116,7 @@ func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	if len(l.entries) == 0 {
 		return nil
 	}
-	offset := l.entries[0].GetIndex()
+	offset := l.FirstIndex
 	return l.entries[l.applied+1-offset : l.committed+1-offset]
 }
 
@@ -129,24 +127,25 @@ func (l *RaftLog) LastIndex() uint64 {
 		lastIndex, _ := l.storage.LastIndex()
 		return lastIndex
 	}
-	return l.entries[0].GetIndex() + uint64(len(l.entries)) - 1
+	return l.FirstIndex + uint64(len(l.entries)) - 1
 }
 
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// Your Code Here (2A).
-	var offset uint64
-	if len(l.entries) == 0 {
-		return 0, nil
+	if len(l.entries) > 0 && i >= l.FirstIndex {
+		return l.entries[i-l.FirstIndex].Term, nil
 	}
-	offset = l.entries[0].GetIndex()
-	if i < offset {
-		return l.storage.Term(i)
+	term, err := l.storage.Term(i)
+	if err == ErrUnavailable && !IsEmptySnap(l.pendingSnapshot) {
+		if i == l.pendingSnapshot.Metadata.Index {
+			term = l.pendingSnapshot.Metadata.Term
+			err = nil
+		} else if i < l.pendingSnapshot.Metadata.Index {
+			err = ErrCompacted
+		}
 	}
-	if int(i-offset+1) > len(l.entries) {
-		return 0, ErrUnavailable
-	}
-	return l.entries[i-offset].GetTerm(), nil
+	return term, err
 }
 
 func (l *RaftLog) DeleteAndAppendEntry(appendEntry pb.Entry) {
@@ -167,4 +166,12 @@ func (l *RaftLog) DeleteAndAppendEntry(appendEntry pb.Entry) {
 	l.committed = min(l.committed, lastIndex-1)
 	l.applied = min(l.applied, lastIndex-1)
 	l.stabled = min(l.stabled, lastIndex-1)
+}
+
+func (l *RaftLog) toSliceIndex(i uint64) int {
+	idx := int(i - l.FirstIndex)
+	if idx < 0 {
+		panic("toSliceIndex: index < 0")
+	}
+	return idx
 }

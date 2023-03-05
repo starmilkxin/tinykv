@@ -176,7 +176,7 @@ func (l *RaftLog) maybeCompact() {
 	// 未压缩的第一个日志的index
 	storageFirstIdx, _ := l.storage.FirstIndex()
 	// 先前的第一个日志的index
-	raftLogFirstIdx := l.entries[0].GetIndex()
+	raftLogFirstIdx := l.FirstIndex
 	// 未压缩的第一个日志的index > 先前的第一个日志的index，则说明先前的日志发生了压缩，需要对日志进行gc
 	if storageFirstIdx > raftLogFirstIdx {
 		entries := l.entries[storageFirstIdx-raftLogFirstIdx:]

@@ -146,6 +146,8 @@ type Raft struct {
 	// valid message from current leader when it is a follower.
 	electionElapsed int
 
+	transferElapsed int
+
 	// leadTransferee is id of the leader transfer target when its value is not zero.
 	// Follow the procedure defined in section 3.10 of Raft phd thesis.
 	// (https://web.stanford.edu/~ouster/cgi-bin/papers/OngaroPhD.pdf)
@@ -205,7 +207,7 @@ func newRaft(c *Config) *Raft {
 		} else {
 			raft.Prs[node] = &Progress{
 				Match: 0,
-				Next:  1,
+				Next:  raft.RaftLog.LastIndex() + 1,
 			}
 		}
 	}
@@ -224,17 +226,20 @@ func (r *Raft) tick() {
 	// Your Code Here (2A).
 	switch r.State {
 	case StateFollower:
-		r.followerTrick()
+		r.followerTick()
 	case StateCandidate:
-		r.candidateTrick()
+		r.candidateTick()
 	case StateLeader:
-		r.leaderTrick()
+		if r.leadTransferee != None {
+			r.transferTick()
+		}
+		r.leaderTick()
 	default:
-		print("raft trick, unknown state: %s", r.State)
+		print("raft tick, unknown state: %s", r.State)
 	}
 }
 
-func (r *Raft) followerTrick() {
+func (r *Raft) followerTick() {
 	r.electionElapsed++
 	// 选举结束还未决出leader，参加选举
 	if r.electionElapsed >= r.electionRandomTimeout {
@@ -246,7 +251,7 @@ func (r *Raft) followerTrick() {
 	}
 }
 
-func (r *Raft) candidateTrick() {
+func (r *Raft) candidateTick() {
 	r.electionElapsed++
 	// 选举结束还未决出leader，参加选举
 	if r.electionElapsed >= r.electionRandomTimeout {
@@ -258,7 +263,7 @@ func (r *Raft) candidateTrick() {
 	}
 }
 
-func (r *Raft) leaderTrick() {
+func (r *Raft) leaderTick() {
 	r.heartbeatElapsed++
 	// 该向其他所有节点发送心跳包了
 	if r.heartbeatElapsed >= r.heartbeatTimeout {
@@ -267,6 +272,14 @@ func (r *Raft) leaderTrick() {
 		_ = r.Step(pb.Message{
 			MsgType: pb.MessageType_MsgBeat,
 		})
+	}
+}
+
+func (r *Raft) transferTick() {
+	r.transferElapsed++
+	if r.transferElapsed > r.electionTimeout*2 {
+		r.leadTransferee = None
+		r.transferElapsed = 0
 	}
 }
 
@@ -302,10 +315,13 @@ func (r *Raft) becomeLeader() {
 	r.State = StateLeader
 	r.heartbeatElapsed = 0
 	r.Lead = r.id
-	for k := range r.Prs {
-		r.Prs[k] = &Progress{
-			Match: 0,
-			Next:  r.RaftLog.LastIndex() + 1, // raft 论文
+	lastIndex := r.RaftLog.LastIndex()
+	for peer := range r.Prs {
+		if peer == r.id {
+			r.Prs[peer].Next = lastIndex + 2
+			r.Prs[peer].Match = lastIndex + 1
+		} else {
+			r.Prs[peer].Next = lastIndex + 1
 		}
 	}
 	// NOTE: Leader should propose a noop entry on its term
@@ -411,11 +427,11 @@ func (r *Raft) Step(m pb.Message) error {
 	case pb.MessageType_MsgSnapshot:
 		switch r.State {
 		case StateFollower:
-
+			r.handleSnapshot(m)
 		case StateCandidate:
-
+			r.handleSnapshot(m)
 		case StateLeader:
-
+			r.handleSnapshot(m)
 		}
 	case pb.MessageType_MsgHeartbeat:
 		switch r.State {
@@ -436,20 +452,25 @@ func (r *Raft) Step(m pb.Message) error {
 	case pb.MessageType_MsgTransferLeader:
 		switch r.State {
 		case StateFollower:
-
+			if r.Lead != None {
+				m.To = r.Lead
+				r.msgs = append(r.msgs, m)
+			}
 		case StateCandidate:
-
+			if r.Lead != None {
+				m.To = r.Lead
+				r.msgs = append(r.msgs, m)
+			}
 		case StateLeader:
-
+			r.handleTransferLeader(m)
 		}
 	case pb.MessageType_MsgTimeoutNow:
 		switch r.State {
 		case StateFollower:
-
+			r.handleHup()
 		case StateCandidate:
-
+			r.handleHup()
 		case StateLeader:
-
 		}
 	}
 	return err
@@ -471,7 +492,10 @@ func (r *Raft) sendHeartbeat(to uint64) {
 // current commit index to the given peer. Returns true if a message was sent.
 func (r *Raft) sendAppend(to uint64) bool {
 	// Your Code Here (2A).
-	prevIndex := r.Prs[to].Next - 1
+	var prevIndex uint64
+	if r.Prs[to].Next > 0 {
+		prevIndex = r.Prs[to].Next - 1
+	}
 	prevTerm, prevTermErr := r.RaftLog.Term(prevIndex)
 	// 如果目标节点需要的最早日志不在当前节点内存中，则要发送的entry已被压缩，发送当前快照
 	if prevTermErr != nil {
@@ -623,7 +647,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	}
 	// 如果接收者日志中没有包含这样一个条目：即该条目的任期在 prevLogIndex 上无法和 prevLogTerm 匹配上，拒绝
 	if len(r.RaftLog.entries) > 0 {
-		offset := r.RaftLog.entries[0].GetIndex()
+		offset := r.RaftLog.FirstIndex
 		if m.GetIndex() >= offset && m.GetLogTerm() != r.RaftLog.entries[m.GetIndex()-offset].GetTerm() {
 			r.msgs = append(r.msgs, msgResp)
 			return
@@ -675,6 +699,16 @@ func (r *Raft) handleAppendResponse(m pb.Message) {
 	}
 	// 更新leader的commit，将超过一半节点的 match所大于的最大值作为commit，同时其与现在的term相等
 	r.checkRaftCommit()
+	// 转移leader
+	if m.From == r.leadTransferee && m.Index == r.RaftLog.LastIndex() {
+		msg := pb.Message{
+			MsgType: pb.MessageType_MsgTimeoutNow,
+			From:    r.id,
+			To:      m.From,
+		}
+		r.msgs = append(r.msgs, msg)
+		r.leadTransferee = None
+	}
 }
 
 func (r *Raft) handleRequestVote(m pb.Message) {
@@ -747,9 +781,11 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 		return
 	}
 	r.becomeFollower(max(r.Term, m.Term), m.From)
+	first := meta.Index + 1
 	if len(r.RaftLog.entries) > 0 {
 		r.RaftLog.entries = nil
 	}
+	r.RaftLog.FirstIndex = first
 	r.RaftLog.applied = meta.Index
 	r.RaftLog.committed = meta.Index
 	r.RaftLog.stabled = meta.Index
@@ -800,21 +836,32 @@ func (r *Raft) handleHeartbeatResponse(m pb.Message) {
 // addNode add a new node to raft group
 func (r *Raft) addNode(id uint64) {
 	// Your Code Here (3A).
+	if _, ok := r.Prs[id]; !ok {
+		r.Prs[id] = &Progress{Next: 1}
+	}
+	r.PendingConfIndex = None
 }
 
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
+	if _, ok := r.Prs[id]; ok {
+		delete(r.Prs, id)
+		if r.State == StateLeader {
+			r.checkRaftCommit()
+		}
+	}
+	r.PendingConfIndex = None
 }
 
 // 更新leader的commit，超过一半节点的match所大于的最大值作为commit，同时其与现在的term相等
 // 如果commit更新，则立即广播给其他节点用以同步commit
 func (r *Raft) checkRaftCommit() {
 	matchList := make([]uint64, 0)
-	for node, progress := range r.Prs {
-		if node == r.id {
-			continue
-		}
+	for _, progress := range r.Prs {
+		//if node == r.id {
+		//	continue
+		//}
 		matchList = append(matchList, progress.Match)
 	}
 	sort.Slice(matchList, func(i, j int) bool {
@@ -836,5 +883,29 @@ func (r *Raft) checkRaftCommit() {
 			}
 			break
 		}
+	}
+}
+
+func (r *Raft) handleTransferLeader(m pb.Message) {
+	if m.From == r.id {
+		return
+	}
+	if r.leadTransferee != None && r.leadTransferee == m.From {
+		return
+	}
+	if _, ok := r.Prs[m.From]; !ok {
+		return
+	}
+	r.leadTransferee = m.From
+	r.transferElapsed = 0
+	if r.Prs[m.From].Match == r.RaftLog.LastIndex() {
+		msg := pb.Message{
+			MsgType: pb.MessageType_MsgTimeoutNow,
+			From:    r.id,
+			To:      m.From,
+		}
+		r.msgs = append(r.msgs, msg)
+	} else {
+		r.sendAppend(m.From)
 	}
 }
