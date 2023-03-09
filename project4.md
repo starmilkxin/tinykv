@@ -46,9 +46,10 @@ Primary Key 的选取通常为从所有操作的 key 中随机选取一个。
 ### KvCheckTxnStatus
 
 1. 通过 CurrentWrite() 获取 primary key 的 Write。
-2. 如果 Write 不为 null，且不是 WriteKindRollback，则说明已经被 commit 了，直接返回 commitTs。
-3. 通过 GetLock() 获取 primary key 的 Lock。如果没有 Lock，说明 primary key 已经被回滚了，创建一个 WriteKindRollback 并直接返回。
-4. 检查 Lock 的 TTL，判断 Lock 是否超时，如果超时，移除该 Lock 和 Value，并创建一个 WriteKindRollback 标记回滚。否则直接返回。
+2. 如果事务的currentWrite不为空，且其write kind不为rollback，说明事务已经被提交，我们可直接返回不做任何处理，注意要在返回的resp中记录commit version。
+3. 如果currentWrite不为空，且其write kind为rollback，说明事务已经被回滚，我们直接返回，不做处理。
+4. 如果currentWrite为空，说明事务由于某些错误或者超时而被移除了锁(或上了新锁)， 而我们还尚未做出处理。我们要做的是写入一条kind为rollback的write标注其将被回滚。返回前将resp的action设置为Action.LockNotExistRollback.
+5. 检查 Lock 的 TTL，判断 Lock 是否超时，如果超时，移除该 Lock 和 Value，并创建一个 WriteKindRollback 标记回滚。否则直接返回。
 
 ### KvBatchRollback
 
